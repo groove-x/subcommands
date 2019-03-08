@@ -24,9 +24,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 )
 
 // A Command represents a single command.
@@ -135,6 +138,9 @@ func (cdr *Commander) Execute(ctx context.Context, args ...interface{}) ExitStat
 			}
 			f := flag.NewFlagSet(name, flag.ContinueOnError)
 			f.Usage = func() { explain(cdr.Error, cmd) }
+			if xcmd, ok := cmd.(*externalCommand); ok {
+				return xcmd.Execute(ctx, f, cdr.topFlags.Args()[1:])
+			}
 			cmd.SetFlags(f)
 			if f.Parse(cdr.topFlags.Args()[1:]) != nil {
 				return ExitUsageError
@@ -381,6 +387,65 @@ func dealias(cmd Command) Command {
 	}
 
 	return cmd
+}
+
+type externalCommand struct {
+	path     string
+	name     string
+	synopsis string
+	usage    string
+	cdr      *Commander
+}
+
+func (c *externalCommand) Name() string     { return c.name }
+func (c *externalCommand) Synopsis() string { return c.synopsis }
+func (c *externalCommand) Usage() string {
+	if c.usage != "" {
+		return fmt.Sprintf(`Usage of %s:
+  %s
+`, c.name, c.usage)
+	}
+	cmd := exec.Command(filepath.Join(c.path, c.cdr.name+"-"+c.name), "--help")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		out = append(out, []byte(err.Error())...)
+	}
+	return string(out)
+}
+func (c *externalCommand) SetFlags(f *flag.FlagSet) {}
+func (c *externalCommand) Execute(ctx context.Context, _ *flag.FlagSet, args ...interface{}) ExitStatus {
+	cmd := exec.CommandContext(ctx, filepath.Join(c.path, c.cdr.name+"-"+c.name), args[0].([]string)...)
+	cmd.Stdout = DefaultCommander.Output
+	cmd.Stderr = DefaultCommander.Error
+	cmd.Stdin = os.Stdin
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(DefaultCommander.Error, "Subcommand %s: %+v\n", c.name, err)
+		return ExitFailure
+	}
+	if err := cmd.Wait(); err != nil {
+		if e, ok := err.(*exec.ExitError); ok {
+			if status, ok := e.ProcessState.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+				return ExitSuccess
+			}
+		}
+		fmt.Fprintf(DefaultCommander.Error, "Subcommand %s: %+v\n", c.name, err)
+		return ExitFailure
+	}
+	return ExitSuccess
+}
+
+func (cdr *Commander) ExternalCommand(path, name, synopsis, usage string) Command {
+	return &externalCommand{
+		path:     path,
+		name:     name,
+		synopsis: synopsis,
+		usage:    usage,
+		cdr:      cdr,
+	}
+}
+
+func ExternalCommand(path, name, synopsis, usage string) Command {
+	return DefaultCommander.ExternalCommand(path, name, synopsis, usage)
 }
 
 // DefaultCommander is the default commander using flag.CommandLine for flags
