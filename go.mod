@@ -1,1 +1,3 @@
-module github.com/google/subcommands
+module github.com/groove-x/subcommands
+
+go 1.12
